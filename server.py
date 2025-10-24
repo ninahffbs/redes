@@ -1,28 +1,107 @@
+# server.py
 import socket
 
 HOST = '127.0.0.1'
 PORT = 5000
 
+# parâmetros do protocolo
+PAYLOAD_MAX = 4     # carga útil máxima por pacote (caracteres)
+INITIAL_WINDOW = 5  # janela inicial oferecida
+
+def checksum_of(data: bytes) -> int:
+    return sum(data) % 256
+
+def parse_packet(packet: str):
+    # formato do pacote: "SEQ|LEN|CHK|PAYLOAD"
+    parts = packet.split('|', 3)
+    if len(parts) < 4:
+        return None
+    seq = int(parts[0])
+    length = int(parts[1])
+    chk = int(parts[2])
+    payload = parts[3]
+    return seq, length, chk, payload
+
 def main():
-
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
     server_socket.bind((HOST, PORT))
-
     server_socket.listen(1)
     print(f"Servidor aguardando conexões em {HOST}:{PORT}...")
 
     conn, addr = server_socket.accept()
     print("Conectado por:", addr)
 
-    data = conn.recv(1024).decode()
-    modo, tamanho = data.split(";")
-    print(f"Cliente iniciou handshake: modo={modo}, tamanho={tamanho}")
+    # handshake inicial
+    data = conn.recv(4096).decode()
+    try:
+        modo, tamanho = data.split(";")
+    except Exception:
+        conn.sendall(b"ERR;handshake_invalido")
+        conn.close()
+        server_socket.close()
+        return
 
-    resposta = f"ACK;modo={modo};tamanho={tamanho}"
+    print(f"Cliente iniciou handshake: modo={modo}, tamanho_max={tamanho}")
+
+    # servidor define janela (pode ser ajustado)
+    window_size = INITIAL_WINDOW
+    resposta = f"ACK;modo={modo};tamanho={tamanho};janela={window_size}"
     conn.sendall(resposta.encode())
+
+    # receber pacotes até receber pacote especial "END"
+    received_fragments = {}  # seq -> payload
+    expected_seq = 0
+    print("Servidor pronto para receber pacotes... (esperando 'END' para finalizar)")
+
+    while True:
+        raw = conn.recv(4096)
+        if not raw:
+            print("Conexão fechada pelo cliente.")
+            break
+        msg = raw.decode()
+
+        # pacote de finalização
+        if msg == "END":
+            # envia confirmação de fechamento
+            conn.sendall("ACK_END".encode())
+            break
+
+        # parse do pacote
+        parsed = parse_packet(msg)
+        if not parsed:
+            # pacote mal formado
+            conn.sendall("NAK|malformed".encode())
+            continue
+
+        seq, length, chk, payload = parsed
+
+        # calcula checksum local
+        local_chk = checksum_of(payload.encode())
+
+        # imprime metadados (exigência do trabalho)
+        print(f"[PACOTE RECEBIDO] seq={seq} len={length} chk={chk} payload='{payload}'")
+
+        # validação (sem simulação de erro aqui)
+        if local_chk != chk or length != len(payload):
+            # detectou inconsistência
+            print(" -> Checagem falhou. Enviando NAK.")
+            conn.sendall(f"NAK|{seq}".encode())
+            continue
+
+        # aceita pacote
+        received_fragments[seq] = payload
+        # Envia ACK positivo (contendo metadados de ACK)
+        ack_msg = f"ACK|{seq}|len={length}|chk={chk}"
+        conn.sendall(ack_msg.encode())
+
+    # reconstituir a mensagem pela ordem das seqs
+    if received_fragments:
+        assembled = ''.join(payload for seq, payload in sorted(received_fragments.items()))
+        print("\n--- Comunicação completa. Mensagem reconstituída no servidor: ---")
+        print(assembled)
+    else:
+        print("\n--- Nenhum fragmento recebido. ---")
 
     conn.close()
     server_socket.close()
