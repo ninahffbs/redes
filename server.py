@@ -1,12 +1,10 @@
-# server.py
 import socket
 
 HOST = '127.0.0.1'
 PORT = 5000
 
-# parâmetros do protocolo
-PAYLOAD_MAX = 4     # carga útil máxima por pacote (caracteres)
-INITIAL_WINDOW = 5  # janela inicial oferecida
+PAYLOAD_MAX = 4 
+INITIAL_WINDOW = 5  
 
 def checksum_of(data: bytes) -> int:
     return sum(data) % 256
@@ -32,7 +30,6 @@ def main():
     conn, addr = server_socket.accept()
     print("Conectado por:", addr)
 
-    # handshake inicial
     data = conn.recv(4096).decode()
     try:
         modo, tamanho = data.split(";")
@@ -44,13 +41,11 @@ def main():
 
     print(f"Cliente iniciou handshake: modo={modo}, tamanho_max={tamanho}")
 
-    # servidor define janela (pode ser ajustado)
     window_size = INITIAL_WINDOW
     resposta = f"ACK;modo={modo};tamanho={tamanho};janela={window_size}"
     conn.sendall(resposta.encode())
 
-    # receber pacotes até receber pacote especial "END"
-    received_fragments = {}  # seq -> payload
+    received_fragments = {}
     expected_seq = 0
     print("Servidor pronto para receber pacotes... (esperando 'END' para finalizar)")
 
@@ -61,41 +56,31 @@ def main():
             break
         msg = raw.decode()
 
-        # pacote de finalização
         if msg == "END":
-            # envia confirmação de fechamento
             conn.sendall("ACK_END".encode())
             break
 
-        # parse do pacote
         parsed = parse_packet(msg)
         if not parsed:
-            # pacote mal formado
             conn.sendall("NAK|malformed".encode())
             continue
 
         seq, length, chk, payload = parsed
 
-        # calcula checksum local
         local_chk = checksum_of(payload.encode())
 
-        # imprime metadados (exigência do trabalho)
         print(f"[PACOTE RECEBIDO] seq={seq} len={length} chk={chk} payload='{payload}'")
 
-        # validação (sem simulação de erro aqui)
         if local_chk != chk or length != len(payload):
             # detectou inconsistência
             print(" -> Checagem falhou. Enviando NAK.")
             conn.sendall(f"NAK|{seq}".encode())
             continue
 
-        # aceita pacote
         received_fragments[seq] = payload
-        # Envia ACK positivo (contendo metadados de ACK)
         ack_msg = f"ACK|{seq}|len={length}|chk={chk}"
         conn.sendall(ack_msg.encode())
 
-    # reconstituir a mensagem pela ordem das seqs
     if received_fragments:
         assembled = ''.join(payload for seq, payload in sorted(received_fragments.items()))
         print("\n--- Comunicação completa. Mensagem reconstituída no servidor: ---")
