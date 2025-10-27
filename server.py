@@ -10,7 +10,6 @@ def checksum_of(data: bytes) -> int:
     return sum(data) % 256
 
 def parse_packet(packet: str):
-    # formato do pacote: "SEQ|LEN|CHK|PAYLOAD"
     parts = packet.split('|', 3)
     if len(parts) < 4:
         return None
@@ -55,11 +54,9 @@ def main():
             print("Conexão fechada pelo cliente.")
             break
         msg = raw.decode()
-
         if msg == "END":
             conn.sendall("ACK_END".encode())
             break
-
         parsed = parse_packet(msg)
         if not parsed:
             conn.sendall("NAK|malformed".encode())
@@ -72,7 +69,6 @@ def main():
         print(f"[PACOTE RECEBIDO] seq={seq} len={length} chk={chk} payload='{payload}'")
 
         if local_chk != chk or length != len(payload):
-            # detectou inconsistência
             print(" -> Checagem falhou. Enviando NAK.")
             conn.sendall(f"NAK|{seq}".encode())
             continue

@@ -1,4 +1,3 @@
-# client.py
 import socket
 import math
 import time
