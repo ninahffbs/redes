@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
 import socket
 import time
+import hashlib
+import base64
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+from Crypto.Random import get_random_bytes
 
+# Rede
 HOST = '127.0.0.1'
 PORT = 5000
 
 PAYLOAD_MAX = 4
 INITIAL_WINDOW = 5
-MAX_SEQ = 256  # usado apenas para impressão/cálculo cíclico, seqs são globais
+MAX_SEQ = 256  # para exibição
+
+# --- Diffie-Hellman params (RFC 3526 Group 14 prime, 2048-bit) ---
+DH_PRIME = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA6"
+    "3B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF", 16
+)
+DH_G = 2
 
 def checksum_of(data: bytes) -> int:
     return sum(data) % 256
@@ -17,7 +31,7 @@ def parse_packet(packet: str):
     if len(parts) < 4:
         return None
     try:
-        seq = int(parts[0])           # seq global
+        seq = int(parts[0])
         length = int(parts[1])
         chk = int(parts[2])
         payload = parts[3]
@@ -25,6 +39,20 @@ def parse_packet(packet: str):
     except ValueError:
         print(f"Erro de conversão em pacote: {packet}")
         return None
+
+# AES-CBC decryption (expects ciphertext bytes with IV prepended)
+def aes_decrypt_from_b64(b64text: str, key: bytes) -> bytes:
+    try:
+        data = base64.b64decode(b64text)
+        if len(data) < 16:
+            raise ValueError("ciphertext too short")
+        iv = data[:16]
+        ct = data[16:]
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        pt = unpad(cipher.decrypt(ct), AES.block_size)
+        return pt
+    except Exception as e:
+        raise
 
 def main():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -41,9 +69,9 @@ def main():
 
     print("Conectado por:", addr)
 
-    # --- Handshake (espera uma linha simples) ---
+    # --- Handshake: recebe modo;tamanho ---
     try:
-        data = conn.recv(4096).decode()
+        data = conn.recv(8192).decode()
     except Exception:
         conn.close()
         server_socket.close()
@@ -58,25 +86,71 @@ def main():
         return
 
     modo = modo.strip().upper()
-    try:
-        tamanho_int = int(tamanho)
-    except:
-        tamanho_int = 0
-
-    print(f"Cliente iniciou handshake: modo={modo}, tamanho_max={tamanho_int}")
+    print(f"Cliente iniciou handshake: modo={modo}, tamanho_max={tamanho}")
 
     window_size = INITIAL_WINDOW
-    resposta = f"ACK;modo={modo};tamanho={tamanho_int};janela={window_size}\n"
+
+    # --- Generate server DH keypair and include server_pub in ACK ---
+    server_priv = int.from_bytes(get_random_bytes(64), 'big') % (DH_PRIME - 2) + 2
+    server_pub = pow(DH_G, server_priv, DH_PRIME)
+
+    # send ACK including server's DH public
+    resposta = f"ACK;modo={modo};tamanho={tamanho};janela={window_size};dh={server_pub}\n"
     conn.sendall(resposta.encode())
 
-    # Estado do receptor
-    received_fragments = {}   # seq_global -> payload (usado tanto GBN quanto SR)
-    expected_seq = 0          # próximo seq global esperado (cumulativo para GBN)
-    buffer = ""               # buffer para montar linhas recebidas
+    # Now expect client's DH message: "DH|<client_pub>\n"
+    conn.settimeout(10.0)
+    buffer = ""
+    client_pub = None
+    try:
+        while True:
+            raw = conn.recv(4096)
+            if not raw:
+                print("Conexão fechada pelo cliente durante DH.")
+                conn.close()
+                server_socket.close()
+                return
+            buffer += raw.decode()
+            if '\n' in buffer:
+                msg, buffer = buffer.split('\n', 1)
+                if msg.startswith("DH|"):
+                    try:
+                        client_pub = int(msg.split('|',1)[1])
+                    except:
+                        print("DH inválido recebido.")
+                        conn.sendall(b"ERR;dh_invalid\n")
+                        conn.close()
+                        server_socket.close()
+                        return
+                    break
+                else:
+                    # ignore unexpected messages before DH
+                    continue
+    except socket.timeout:
+        print("Timeout aguardando DH do cliente.")
+        conn.close()
+        server_socket.close()
+        return
+    except Exception as e:
+        print("Erro no handshake DH:", e)
+        conn.close()
+        server_socket.close()
+        return
 
+    # Derive shared secret and AES key
+    shared = pow(client_pub, server_priv, DH_PRIME)
+    shared_bytes = str(shared).encode()
+    aes_key = hashlib.sha256(shared_bytes).digest()  # 32 bytes -> AES-256
+    print("DH concluído — chave simétrica derivada (AES-256).")
+
+    # --- Pronto para receber pacotes cifrados (payloads base64) ---
+    conn.settimeout(None)  # volta blocking
+    received_fragments = {}
+    expected_seq = 0
+    buffer = ""
     print("Servidor pronto para receber pacotes... (esperando 'END')")
 
-    # modo pode ser 'GBN' ou 'SR'; trate qualquer outro como 'GBN' por padrão
+    # Normalize mode
     if modo not in ('GBN', 'SR'):
         modo = 'GBN'
 
@@ -95,7 +169,6 @@ def main():
             break
 
         buffer += raw.decode()
-
         while '\n' in buffer:
             msg, buffer = buffer.split('\n', 1)
             if not msg:
@@ -108,79 +181,80 @@ def main():
 
             parsed = parse_packet(msg)
             if not parsed:
-                # pacote malformado
                 print("Pacote malformado. Enviando NAK|-1")
                 conn.sendall("NAK|-1\n".encode())
                 continue
 
-            seq_global, length, chk, payload = parsed
-            local_chk = checksum_of(payload.encode())
+            seq_global, length, chk, payload_b64 = parsed
+            # payload_b64 is base64-encoded ciphertext string
+            # verify checksum on the ASCII payload bytes (base64 text)
+            local_chk = checksum_of(payload_b64.encode())
 
-            print(f"[PACOTE RECEBIDO] seq={seq_global} (cíclico={seq_global % MAX_SEQ}) len={length} chk={chk} payload='{payload}'")
+            print(f"[PACOTE RECEBIDO] seq={seq_global} (cíclico={seq_global % MAX_SEQ}) len={length} chk={chk} payload(b64)='{payload_b64}'")
 
-            # integridade
-            if local_chk != chk or len(payload) != length:
+            # Integrity check (checksum and length)
+            if local_chk != chk or len(payload_b64) != length:
                 print(" -> Erro de integridade. Enviando NAK para esse seq.")
-                # envie NAK pedindo reenvio desse seq
                 conn.sendall(f"NAK|{seq_global}\n".encode())
                 continue
 
+            # Depending on mode, handle GBN or SR
             if modo == 'GBN':
-                # GBN: aceita só se seq == expected_seq
                 if seq_global != expected_seq:
                     print(f" -> Pacote fora de ordem (esperado={expected_seq}). Descartando e enviando ACK cumulativo.")
                     conn.sendall(f"ACK|{expected_seq}\n".encode())
                     continue
 
-                # pacote em ordem e íntegro
+                # accept and store
                 print(" -> Pacote íntegro e em ordem (GBN).")
-                received_fragments[expected_seq] = payload
+                received_fragments[expected_seq] = payload_b64
                 expected_seq += 1
-                # ACK cumulativo indica próximo seq global esperado
                 conn.sendall(f"ACK|{expected_seq}\n".encode())
 
-            else:  # modo == 'SR'
-                # janelamento SR: aceitar pacotes dentro da janela [expected_seq, expected_seq+window_size-1]
+            else:  # SR
                 win_start = expected_seq
                 win_end = expected_seq + window_size - 1
-
                 if seq_global < win_start:
-                    # pacote já recebido / muito antigo (reenvio duplicado). reenvia ACK individual.
                     print(f" -> Pacote com seq < janela (seq={seq_global} < start={win_start}). Reenviando ACK_IND.")
                     conn.sendall(f"ACK_IND|{seq_global}\n".encode())
                     continue
-
                 if seq_global > win_end:
-                    # pacote fora da janela (muito adiantado) — descartar
-                    print(f" -> Pacote fora de janela SR (esperado interval [{win_start},{win_end}]). Descartando.")
-                    # opcional: enviar ACK do último cumulativo
-                    conn.sendall(f"ACK_IND|{seq_global}\n".encode())  # informar recebimento (pode ser ignorado pelo cliente se fora da janela)
+                    print(f" -> Pacote fora da janela SR (esperado interval [{win_start},{win_end}]). Descartando.")
+                    # respond with ACK_IND for possible duplicate handling
+                    conn.sendall(f"ACK_IND|{seq_global}\n".encode())
                     continue
 
-                # pacote aceitável dentro da janela
                 if seq_global in received_fragments:
-                    # já recebido — reenviar ACK
                     print(" -> Pacote já recebido (duplicado). Reenviando ACK_IND.")
                     conn.sendall(f"ACK_IND|{seq_global}\n".encode())
                     continue
 
-                # armazena pacote
-                received_fragments[seq_global] = payload
+                # accept
+                received_fragments[seq_global] = payload_b64
                 print(" -> Pacote aceito (SR). Enviando ACK_IND.")
                 conn.sendall(f"ACK_IND|{seq_global}\n".encode())
 
-                # avançar expected_seq enquanto houver fragmentos contíguos
                 while expected_seq in received_fragments:
                     expected_seq += 1
 
         if msg == "END":
             break
 
-    # Montagem final da mensagem (se houver fragmentos)
+    # --- Reconstruct and decrypt ---
     if received_fragments:
-        assembled = ''.join(payload for seq, payload in sorted(received_fragments.items()))
-        print("\n--- Mensagem Reconstituída ---")
-        print(assembled)
+        assembled_b64 = ''.join(payload for seq, payload in sorted(received_fragments.items()))
+        try:
+            plaintext_bytes = aes_decrypt_from_b64(assembled_b64, aes_key)
+            try:
+                plaintext = plaintext_bytes.decode()
+            except:
+                plaintext = repr(plaintext_bytes)
+            print("\n--- Comunicação completa. Mensagem decriptada no servidor: ---")
+            print(plaintext)
+        except Exception as e:
+            print("\n--- Erro ao decifrar a mensagem:", e)
+            print("Conteúdo (base64) reconstituído (não foi possível decifrar):")
+            print(assembled_b64[:200] + "..." if len(assembled_b64) > 200 else assembled_b64)
     else:
         print("\n--- Nenhum fragmento recebido. ---")
 

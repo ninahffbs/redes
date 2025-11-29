@@ -2,6 +2,11 @@
 import socket
 import time
 import random
+import hashlib
+import base64
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from Crypto.Random import get_random_bytes
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -9,10 +14,18 @@ PORT = 5000
 PAYLOAD_MAX = 4
 SEQ_START = 0
 TIMEOUT = 3.0     # segundos
-MAX_SEQ = 256     # para apresentação cíclica (não usado para limitar seq global)
+MAX_SEQ = 256     # para apresentação cíclica
 
 # Simulação
 LOSS_RATE = 0.1   # perda aleatória (ajuste para 0.0 se quiser sem perdas)
+
+# --- Diffie-Hellman params (must match server) ---
+DH_PRIME = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA6"
+    "3B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF", 16
+)
+DH_G = 2
 
 def recv_until(sock, delimiter=b'\n'):
     buffer = b''
@@ -33,8 +46,15 @@ def recv_until(sock, delimiter=b'\n'):
 def checksum_of(data: bytes) -> int:
     return sum(data) % 256
 
+def aes_encrypt_to_b64(plaintext_bytes: bytes, key: bytes) -> str:
+    iv = get_random_bytes(16)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    ct = cipher.encrypt(pad(plaintext_bytes, AES.block_size))
+    out = iv + ct
+    return base64.b64encode(out).decode()
+
 def make_packet(seq: int, payload: str, corrupt: bool = False) -> str:
-    # seq: número global do fragmento
+    # payload is ASCII text (base64 ciphertext) at this stage
     length = len(payload)
     chk = checksum_of(payload.encode())
     if corrupt:
@@ -72,10 +92,11 @@ def main():
 
     simular_erro = input("Simular erro determinístico no primeiro pacote? (s/n): ").strip().lower() == 's'
 
-    # Envia handshake
+    # Envia handshake (mode;tamanho)
     handshake = f"{modo};{tamanho_maximo}"
     client_socket.sendall(handshake.encode())
 
+    # Recebe ACK com server_pub (dh)
     resposta = recv_until(client_socket)
     if resposta is None:
         print("Erro no handshake: Servidor fechou a conexão.")
@@ -84,17 +105,35 @@ def main():
 
     print("Resposta do servidor (handshake):", resposta)
     window_size = 5
+    server_dh = None
     try:
         parts = resposta.split(';')
         for p in parts:
             if p.startswith("janela="):
                 window_size = int(p.split('=',1)[1])
+            if p.startswith("dh="):
+                server_dh = int(p.split('=',1)[1])
     except:
         pass
 
+    if server_dh is None:
+        print("Servidor não enviou parâmetro DH. Abortando.")
+        client_socket.close()
+        return
+
+    # Generate client DH and send
+    client_priv = int.from_bytes(get_random_bytes(64), 'big') % (DH_PRIME - 2) + 2
+    client_pub = pow(DH_G, client_priv, DH_PRIME)
+    # compute shared secret
+    shared = pow(server_dh, client_priv, DH_PRIME)
+    aes_key = hashlib.sha256(str(shared).encode()).digest()  # 32 bytes AES-256
+    # send client pub to server
+    client_socket.sendall(f"DH|{client_pub}\n".encode())
+    print("DH concluído — chave simétrica derivada (AES-256).")
+
     print(f"Janela determinada pelo servidor: {window_size}")
 
-    # Mensagem
+    # Mensagem plain text (will be encrypted)
     while True:
         message = input("Digite a mensagem a enviar (ou vazio para 'Olá mundo!'): ")
         if not message:
@@ -104,33 +143,30 @@ def main():
             continue
         break
 
-    fragments = [message[i:i+PAYLOAD_MAX] for i in range(0, len(message), PAYLOAD_MAX)]
+    # Encrypt whole plaintext first, base64-encode ciphertext
+    ciphertext_b64 = aes_encrypt_to_b64(message.encode(), aes_key)
+    # Now fragment the base64 ciphertext into PAYLOAD_MAX chars chunks
+    fragments = [ciphertext_b64[i:i+PAYLOAD_MAX] for i in range(0, len(ciphertext_b64), PAYLOAD_MAX)]
     total_fragments = len(fragments)
-    print(f"Mensagem com {len(message)} chars -> {total_fragments} fragmentos de até {PAYLOAD_MAX} chars.")
+    print(f"Mensagem original {len(message)} chars -> ciphertext base64 {len(ciphertext_b64)} chars -> {total_fragments} fragmentos de até {PAYLOAD_MAX} chars.")
 
     # Estado comum
-    base_seq = SEQ_START                  # menor seq não confirmado
-    next_seq_to_send = SEQ_START         # próximo seq a enviar
-    window_packets = {}                  # seq -> (packet_str, payload)
+    base_seq = SEQ_START
+    next_seq_to_send = SEQ_START
+    window_packets = {}
     client_socket.settimeout(TIMEOUT)
 
-    # Para SR: manter tempos por pacote (seq -> last_sent_time)
-    send_times = {}   # usado apenas em SR
-
-    # Variável para garantir que erro determinístico afeta apenas o primeiro envio
+    # Para SR: manter tempos por pacote
+    send_times = {}
     simular_erro_ativo = simular_erro
 
     if modo == 'GBN':
-        # GBN - temporizador único
         timer = None
-
         while base_seq < total_fragments:
-            # enviar pacotes até encher janela
             while next_seq_to_send < total_fragments and (next_seq_to_send - base_seq) < window_size:
                 payload = fragments[next_seq_to_send]
                 corrupt = simular_erro_ativo and next_seq_to_send == SEQ_START
                 pkt = make_packet(next_seq_to_send, payload, corrupt)
-
                 if corrupt:
                     simular_erro_ativo = False
                     print("-> Simulação de erro determinístico desativada para retransmissões.")
@@ -140,7 +176,7 @@ def main():
                 else:
                     client_socket.sendall(pkt.encode())
                     window_packets[next_seq_to_send] = (pkt, payload)
-                    print(f"[ENVIADO] seq={next_seq_to_send % MAX_SEQ} (Global={next_seq_to_send}) len={len(payload)} chk={checksum_of(payload.encode())} payload='{payload}'")
+                    print(f"[ENVIADO] seq={next_seq_to_send % MAX_SEQ} (Global={next_seq_to_send}) len={len(payload)} chk={checksum_of(payload.encode())} payload(b64)='{payload}'")
 
                 if timer is None and next_seq_to_send == base_seq:
                     timer = time.time()
@@ -149,7 +185,6 @@ def main():
                 next_seq_to_send += 1
                 time.sleep(0.02)
 
-            # Receber ACK/NAK
             try:
                 if timer is not None and (time.time() - timer) > TIMEOUT:
                     raise socket.timeout
@@ -186,7 +221,6 @@ def main():
                     except:
                         nak_seq = -1
                     print(f"[NAK RECEBIDO] NAK para seq={nak_seq}. Forçando Timeout para retransmissão GBN.")
-                    # forçar retransmissão da janela
                     raise socket.timeout
 
                 elif msg == "ACK_END":
@@ -197,7 +231,6 @@ def main():
 
             except socket.timeout:
                 print(f"!!! [TIMEOUT] Timer expirou. Retransmitindo (Go-Back-N) a partir de base_seq={base_seq}.")
-                # retransmitir a partir da base
                 timer = time.time()
                 next_seq_to_send = base_seq
                 window_packets.clear()
@@ -208,12 +241,10 @@ def main():
 
     else:
         # SR mode
-        acked = set()   # conjunto de seq confirmados
-        # initialize send_times empty
+        acked = set()
         send_times = {}
 
         while base_seq < total_fragments:
-            # enviar pacotes novos até encher janela
             while next_seq_to_send < total_fragments and (next_seq_to_send - base_seq) < window_size:
                 payload = fragments[next_seq_to_send]
                 corrupt = simular_erro_ativo and next_seq_to_send == SEQ_START
@@ -223,22 +254,20 @@ def main():
                     simular_erro_ativo = False
                     print("-> Simulação de erro determinístico desativada para retransmissões.")
 
-                # >>> correção crítica: registrar pacote e timer MESMO SE a perda for simulada <<< #
-                # registra sempre o pacote localmente e inicializa o timer
+                # always register packet and timer even if loss simulated
                 window_packets[next_seq_to_send] = (pkt, payload)
                 send_times[next_seq_to_send] = time.time()
 
                 if random.random() < LOSS_RATE:
-                    # simula perda: não envia, mas timer já está registrado
                     print(f"!!! [PERDA SIMULADA] Pacote seq={next_seq_to_send} (não enviado)")
                 else:
                     client_socket.sendall(pkt.encode())
-                    print(f"[ENVIADO] seq={next_seq_to_send % MAX_SEQ} (Global={next_seq_to_send}) len={len(payload)} chk={checksum_of(payload.encode())} payload='{payload}'")
+                    print(f"[ENVIADO] seq={next_seq_to_send % MAX_SEQ} (Global={next_seq_to_send}) len={len(payload)} chk={checksum_of(payload.encode())} payload(b64)='{payload}'")
 
                 next_seq_to_send += 1
                 time.sleep(0.02)
 
-            # Checar timeouts por pacote (SR)
+            # check SR timeouts and retransmit as needed
             now = time.time()
             to_retransmit = []
             for seq, t0 in list(send_times.items()):
@@ -248,23 +277,22 @@ def main():
                     to_retransmit.append(seq)
 
             for seq in to_retransmit:
-                pkt = make_packet(seq, payload, corrupt=False)
-                window_packets[seq] = (pkt, payload)
+                pkt, payload = window_packets.get(seq, (None, None))
                 if pkt is None:
-                    # nada a reenviar (talvez já acked)
                     send_times.pop(seq, None)
                     continue
+                # regenerate pkt on retransmission to avoid resending a previously corrupted packet
+                pkt = make_packet(seq, payload, corrupt=False)
+                window_packets[seq] = (pkt, payload)
                 print(f"!!! [TIMEOUT SR] Retransmitindo seq={seq}")
-                # tentativa de retransmissão (a perda pode ocorrer de novo)
                 if random.random() < LOSS_RATE:
                     print(f"!!! [PERDA SIMULADA] (na retransmissão) seq={seq}")
                 else:
                     client_socket.sendall(pkt.encode())
                 send_times[seq] = time.time()
 
-            # Tentar receber mensagens (ACK_IND / NAK / ACK_END)
+            # receive ACK_IND / NAK / ACK_END
             try:
-                # ajuste timeout curto para ficar verificando timers com frequência
                 client_socket.settimeout(0.5)
                 msg = recv_until(client_socket)
                 client_socket.settimeout(TIMEOUT)
@@ -281,27 +309,24 @@ def main():
                         continue
                     print(f"[ACK_IND RECEBIDO] seq={ack_seq}")
                     acked.add(ack_seq)
-                    # limpar estruturas
                     window_packets.pop(ack_seq, None)
                     send_times.pop(ack_seq, None)
-                    # mover base_seq adiante se base já acked
                     while base_seq in acked:
                         base_seq += 1
 
                 elif msg.startswith("ACK|"):
-                    # servidor em GBN (caso servidor implementou GBN)
                     parts = msg.split('|')
                     try:
                         ack_expected = int(parts[1])
                     except:
                         continue
                     print(f"[ACK (cumulativo) recebido] ack_expected={ack_expected}")
-                    # marcar todos até ack_expected-1 como acked
                     for seq in range(base_seq, ack_expected):
                         acked.add(seq)
                         window_packets.pop(seq, None)
                         send_times.pop(seq, None)
                     base_seq = ack_expected
+
                 elif msg.startswith("NAK|"):
                     parts = msg.split('|')
                     try:
@@ -310,24 +335,19 @@ def main():
                         nak_seq = -1
                     print(f"[NAK RECEBIDO] nak_seq={nak_seq}")
                     if nak_seq >= 0 and nak_seq in window_packets:
-                        # retransmitir só esse pacote (SR)
+                        # regenerate packet before retransmission to fix deterministic-corruption case
                         pkt, payload = window_packets[nak_seq]
-
-# 🎯 Correção: regenerar o pacote com checksum CORRETO
                         pkt = make_packet(nak_seq, payload, corrupt=False)
                         window_packets[nak_seq] = (pkt, payload)
-
                         print(f"-> SR: retransmitindo seq={nak_seq} por causa de NAK (checksum corrigido)")
                         if random.random() < LOSS_RATE:
                             print(f"!!! [PERDA SIMULADA] (na retransmissão NAK) seq={nak_seq}")
                         else:
                             client_socket.sendall(pkt.encode())
-
                         send_times[nak_seq] = time.time()
-
                     else:
-                        # se nak_seq inválido, ignorar ou retransmitir janela (por segurança)
                         print("-> NAK inválido ou fora da janela. Ignorando.")
+
                 elif msg == "ACK_END":
                     print("Servidor confirmou encerramento (ACK_END).")
                     break
@@ -335,15 +355,12 @@ def main():
                     print("[RECEBIDO] (não reconhecido):", msg)
 
             except socket.timeout:
-                # sem mensagens; o loop continuará e timeouts SR serão checados
                 pass
             except Exception as e:
                 print("Erro ao receber:", e)
                 break
 
-        # fim do loop SR/GBN principal
-
-    # Envio de END
+    # After loop, we already sent all fragments; send END
     try:
         client_socket.sendall("END\n".encode())
         final_ack = recv_until(client_socket)
